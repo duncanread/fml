@@ -1,0 +1,106 @@
+import time
+import datetime
+import os
+import hmac
+import hashlib
+import requests
+import json
+import base64
+import uuid
+import pandas as pd
+import numpy as np
+
+# ✅ Load API Credentials from Environment Variables
+BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY")
+BLOFIN_API_SECRET = os.getenv("BLOFIN_API_SECRET")
+BLOFIN_API_PASSPHRASE = os.getenv("BLOFIN_API_PASSPHRASE")
+BLOFIN_BASE_URL = "https://demo-trading-openapi.blofin.com"
+
+# ✅ Verify API Keys Exist
+if not BLOFIN_API_KEY or not BLOFIN_API_SECRET or not BLOFIN_API_PASSPHRASE:
+    raise ValueError("❌ ERROR: Missing Blofin API credentials.")
+
+# ✅ Logging Function
+def write_to_log(message):
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_path = os.path.expanduser("~/StrategyScripts/test.log")
+    with open(log_path, "a") as file:
+        file.write(f"[{timestamp}] {message}\n")
+
+# ✅ Generate HMAC-SHA256 Signature
+def generate_signature(secret_key, method, path, timestamp, nonce, body=None):
+    body_str = json.dumps(body) if body else ""
+    prehash = f"{path}{method}{timestamp}{nonce}{body_str}"
+    hex_signature = hmac.new(secret_key.encode(), prehash.encode(), hashlib.sha256).hexdigest().encode()
+    return base64.b64encode(hex_signature).decode()
+
+# ✅ Function to Retrieve Active TP/SL Orders
+def get_active_tpsl_orders():
+    try:
+        # ✅ Correct API endpoint for active TP/SL orders
+        path = "/api/v1/trade/orders-tpsl-pending"
+        method = "GET"
+        timestamp = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())
+        body = None  # GET request, so no body
+
+        # Generate signature
+        signature = generate_signature(BLOFIN_API_SECRET, method, path, timestamp, nonce, body)
+
+        # Set headers
+        headers = {
+            "ACCESS-KEY": BLOFIN_API_KEY,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-NONCE": nonce,
+            "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
+            "Content-Type": "application/json"
+        }
+
+        # Make the request
+        response = requests.get(BLOFIN_BASE_URL + path, headers=headers)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+
+        # Parse the response
+        data = response.json()
+        if data.get("code") == "0":
+            orders = data.get("data", [])
+            if not orders:
+                write_to_log("ℹ️ No active TP/SL orders found.")
+                return []
+            write_to_log(f"✅ Retrieved {len(orders)} active TP/SL orders.")
+            return orders
+        else:
+            error_msg = f"❌ Error retrieving TP/SL orders: {data.get('msg')}"
+            write_to_log(error_msg)
+            raise ValueError(error_msg)
+
+    except requests.exceptions.RequestException as req_err:
+        write_to_log(f"❌ Request Error: {str(req_err)}")
+        raise  # Re-raise the error for debugging
+
+    except Exception as e:
+        write_to_log(f"❌ Unexpected Exception: {str(e)}")
+        raise  # Re-raise the error for debugging
+
+# ✅ Example usage
+if __name__ == "__main__":
+    try:
+        tpsl_orders = get_active_tpsl_orders()
+        if tpsl_orders:
+            print("\n📌 Active TP/SL Orders:\n")
+            for order in tpsl_orders:
+                print(f"🆔 Order ID: {order['tpslId']}")
+                print(f"📈 Instrument: {order['instId']}")
+                print(f"📊 Side: {order['side'].capitalize()} ({order['positionSide']})")
+                print(f"🎯 TP Trigger: {order['tpTriggerPrice']} USDT")
+                print(f"🛑 SL Trigger: {order['slTriggerPrice']} USDT")
+                print(f"🔢 Size: {order['size']} contracts")
+                print(f"📌 Leverage: {order['leverage']}x")
+                print(f"🔗 Client Order ID: {order['clientOrderId'] if order['clientOrderId'] else 'N/A'}")  # ✅ Ensuring correct key name
+                print(f"📅 Created At: {datetime.datetime.fromtimestamp(int(order['createTime']) / 1000)}")
+                print("-" * 40)
+        else:
+            print("ℹ️ No active TP/SL orders.")
+    except Exception as e:
+        print(f"❌ Script Error: {str(e)}")
