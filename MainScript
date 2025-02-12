@@ -1,0 +1,259 @@
+import time
+import datetime
+import os
+import hmac
+import hashlib
+import requests
+import json
+import base64
+import uuid
+import pandas as pd
+import numpy as np
+
+# ✅ Load API Credentials from Environment Variables
+BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY")
+BLOFIN_API_SECRET = os.getenv("BLOFIN_API_SECRET")
+BLOFIN_API_PASSPHRASE = os.getenv("BLOFIN_API_PASSPHRASE")
+BLOFIN_BASE_URL = "https://demo-trading-openapi.blofin.com"
+
+# ✅ Verify API Keys Exist
+if not BLOFIN_API_KEY or not BLOFIN_API_SECRET or not BLOFIN_API_PASSPHRASE:
+    raise ValueError("❌ ERROR: Missing Blofin API credentials.")
+
+# ✅ Logging Function
+def write_to_log(message):
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_path = os.path.expanduser("~/StrategyScripts/test.log")
+    with open(log_path, "a") as file:
+        file.write(f"[{timestamp}] {message}\n")
+
+# ✅ Generate HMAC-SHA256 Signature
+def generate_signature(secret_key, method, path, timestamp, nonce, body=None):
+    body_str = json.dumps(body) if body else ""
+    prehash = f"{path}{method}{timestamp}{nonce}{body_str}"
+    hex_signature = hmac.new(secret_key.encode(), prehash.encode(), hashlib.sha256).hexdigest().encode()
+    return base64.b64encode(hex_signature).decode()
+
+# ✅ Fetch Live Price
+def get_live_price(symbol):
+    try:
+        response = requests.get(f"{BLOFIN_BASE_URL}/api/v1/market/tickers?instId={symbol}")
+        data = response.json()
+        if "data" in data and len(data["data"]) > 0:
+            return float(data["data"][0]["last"])
+    except Exception as e:
+        write_to_log(f"❌ Error fetching price: {e}")
+    return None
+
+# ✅ Fetch Historical Data
+def get_historical_data(symbol, bar="1H", limit=14):
+    try:
+        url = f"{BLOFIN_BASE_URL}/api/v1/market/candles?instId={symbol}&bar={bar}&limit={limit}"
+        response = requests.get(url)
+        data = response.json()
+        if "data" in data and len(data["data"]) > 0:
+            df = pd.DataFrame(data["data"], columns=[
+                "timestamp", "open", "high", "low", "close", "vol", "volCurrency", "volCurrencyQuote", "confirm"
+            ])
+            df["open"] = df["open"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"] = df["low"].astype(float)
+            df["close"] = df["close"].astype(float)
+            return df
+    except Exception as e:
+        write_to_log(f"❌ Error fetching historical data: {e}")
+    return None
+
+# ✅ Calculate ATR
+def calculate_atr(df, period=14):
+    df["high-low"] = df["high"] - df["low"]
+    df["high-close"] = np.abs(df["high"] - df["close"].shift(1))
+    df["low-close"] = np.abs(df["low"] - df["close"].shift(1))
+    df["true_range"] = df[["high-low", "high-close", "low-close"]].max(axis=1)
+    df["ATR"] = df["true_range"].rolling(window=period).mean()
+    return df["ATR"].iloc[-1]
+
+# ✅ Place Market Order
+def place_trade(symbol, side, btc_quantity):
+    endpoint = "/api/v1/trade/order"
+    url = BLOFIN_BASE_URL + endpoint
+    method = "POST"
+
+    contract_size = 0.001  # Adjust per BloFin's contract size
+    size_full = float(btc_quantity) / contract_size
+    size_half = str(int(size_full / 2))
+
+    price = get_live_price(symbol)
+    if not price:
+        write_to_log("❌ Failed to fetch live price. Exiting...")
+        return None
+
+    df = get_historical_data(symbol)
+    if df is None or df.empty:
+        write_to_log("❌ Failed to fetch historical data. Exiting...")
+        return None
+    atr_value = calculate_atr(df)
+
+    atr_multiplier_sl = 1.5
+    atr_multiplier_tp1 = 1.0
+    atr_multiplier_tp2 = 3.0
+
+    if side.lower() == "buy":
+        sl_trigger_price = str(round(price - (atr_value * atr_multiplier_sl), 2))
+        tp1_trigger_price = str(round(price + (atr_value * atr_multiplier_tp1), 2))
+        tp2_trigger_price = str(round(price + (atr_value * atr_multiplier_tp2), 2))
+    else:
+        sl_trigger_price = str(round(price + (atr_value * atr_multiplier_sl), 2))
+        tp1_trigger_price = str(round(price - (atr_value * atr_multiplier_tp1), 2))
+        tp2_trigger_price = str(round(price - (atr_value * atr_multiplier_tp2), 2))
+
+    def send_order(tp_trigger_price, order_size):
+        timestamp = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())
+
+        body = {
+            "instId": symbol,
+            "side": side.lower(),
+            "orderType": "market",
+            "size": order_size,
+            "marginMode": "cross",
+            "positionSide": "long" if side.lower() == "buy" else "short",
+            "reduceOnly": "false",
+            "slTriggerPrice": sl_trigger_price,
+            "slOrderPrice": "-1",
+            "tpTriggerPrice": tp_trigger_price,
+            "tpOrderPrice": "-1"
+        }
+
+        signature = generate_signature(BLOFIN_API_SECRET, method, endpoint, timestamp, nonce, body)
+
+        headers = {
+            "ACCESS-KEY": BLOFIN_API_KEY,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-NONCE": nonce,
+            "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
+            "Content-Type": "application/json"
+        }
+
+        write_to_log(f"🔍 Sending Market Order: {json.dumps(body, indent=2)}")
+
+        response = requests.post(url, headers=headers, json=body)
+
+        write_to_log(f"💼 Status Code: {response.status_code}")
+        write_to_log(f"💼 Response: {response.text}")
+
+        return response.json()
+
+    response1 = send_order(tp1_trigger_price, size_half)
+    response2 = send_order(tp2_trigger_price, size_half)
+
+    return {"order_1": response1, "order_2": response2}
+
+# ✅ Main Function
+def main():
+    action = os.getenv("TRADE_ACTION")
+    if not action:
+        write_to_log("❌ No action provided. Exiting...")
+        return
+
+    symbol = "BTC-USDT"
+    btc_quantity = "0.5"
+
+    side = "buy" if action == "long" else "sell" if action == "short" else None
+    if side:
+        trade_response = place_trade(symbol, side, btc_quantity)
+        write_to_log(f"💼 Trade Response: {trade_response}")
+    else:
+        write_to_log("❌ Invalid trade action. Exiting...")
+
+
+# ✅ Run the script
+if __name__ == '__main__':
+    main()
+
+# ✅ Function to Retrieve Active TP/SL Orders
+def get_active_tpsl_orders():
+    try:
+        # ✅ Correct API endpoint for active TP/SL orders
+        path = "/api/v1/trade/orders-tpsl-pending"
+        method = "GET"
+        timestamp = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())
+        body = None  # GET request, so no body
+
+        # Generate signature
+        signature = generate_signature(BLOFIN_API_SECRET, method, path, timestamp, nonce, body)
+
+        # Set headers
+        headers = {
+            "ACCESS-KEY": BLOFIN_API_KEY,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-NONCE": nonce,
+            "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
+            "Content-Type": "application/json"
+        }
+
+        # Make the request
+        response = requests.get(BLOFIN_BASE_URL + path, headers=headers)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+
+        # Parse the response
+        data = response.json()
+        if data.get("code") == "0":
+            orders = data.get("data", [])
+            if not orders:
+                write_to_log("ℹ️ No active TP/SL orders found.")
+                return []
+            write_to_log(f"✅ Retrieved {len(orders)} active TP/SL orders.")
+            return orders
+        else:
+            error_msg = f"❌ Error retrieving TP/SL orders: {data.get('msg')}"
+            write_to_log(error_msg)
+            raise ValueError(error_msg)
+
+    except requests.exceptions.RequestException as req_err:
+        write_to_log(f"❌ Request Error: {str(req_err)}")
+        raise  # Re-raise the error for debugging
+
+    except Exception as e:
+        write_to_log(f"❌ Unexpected Exception: {str(e)}")
+        raise  # Re-raise the error for debugging
+
+# ✅ Example usage
+if __name__ == "__main__":
+    try:
+        main()
+        time.sleep(2)
+
+        tpsl_orders = get_active_tpsl_orders()
+        
+        print("\n🛠 DEBUG: Full TP/SL Orders Data 🛠")
+        print(json.dumps(tpsl_orders, indent=2))  # Debugging: Print full structure
+        print("-" * 60)
+
+        if tpsl_orders:
+            print("\n📌 Active TP/SL Orders:\n")
+            for order in tpsl_orders:
+                print(f"🛠 DEBUG: Order Structure: {json.dumps(order, indent=2)}")  # Debugging
+
+                print(f"🆔 Order ID: {order.get('tpslId', 'N/A')}")
+                print(f"📈 Instrument: {order.get('instId', 'N/A')}")
+                print(f"📊 Side: {order.get('side', 'N/A').capitalize()} ({order.get('positionSide', 'N/A')})")
+                print(f"🎯 TP Trigger: {order.get('tpTriggerPrice', 'N/A')} USDT")
+                print(f"🛑 SL Trigger: {order.get('slTriggerPrice', 'N/A')} USDT")
+                print(f"🔢 Size: {order.get('size', 'N/A')} contracts")
+                print(f"📌 Leverage: {order.get('leverage', 'N/A')}x")
+                print(f"🔗 Client Order ID: {order.get('clientOrderId', 'N/A')}")
+                print(f"📅 Created At: {datetime.datetime.fromtimestamp(int(order.get('createTime', 0)) / 1000)}")
+                print("-" * 40)
+        else:
+            print("ℹ️ No active TP/SL orders.")
+
+        import sys
+        sys.stdout.flush()
+
+    except Exception as e:
+        print(f"❌ Script Error: {str(e)}")
+        write_to_log(f"❌ Script Error: {str(e)}")
